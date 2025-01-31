@@ -1,0 +1,40 @@
+# https://taskfile.dev
+
+version: '3'
+
+vars:
+  GREETING: Hello, World!
+
+tasks:
+
+  build:
+    desc: build doh binary
+    vars:
+      GIT_COMMIT:
+        sh: git rev-parse HEAD
+      APP_VERSION:
+        sh: git describe --tags --always
+      BUILD_TIME:
+        sh: date -u +%Y-%m-%dT%H:%M:%SZ
+    cmds:
+      - go build -trimpath -o doh -ldflags \
+        "-w -s -X main.GitCommit={{.GIT_COMMIT}} -X main.AppVersion={{.APP_VERSION}} -X main.BuildTime={{.BUILD_TIME}}"
+
+  docker:
+    desc: build docker image
+    vars:
+      TAG:
+        sh: git describe --tags --always
+    cmds:
+      - docker buildx build --platform linux/amd64,linux/arm64 --push --pull -t ghcr.io/ysicing/doh -t ghcr.io/ysicing/doh:{{.TAG}} -t ysicing/doh:{{.TAG}} -t ysicing/doh .
+
+  trivy:
+    desc: scan docker image
+    deps:
+      - docker
+    cmds:
+      - trivy image ghcr.io/ysicing/doh --scanners vuln
+
+  default:
+    cmds:
+      - task: trivy
