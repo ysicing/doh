@@ -11,11 +11,14 @@ import (
 	"os/signal"
 	"runtime"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/ergoapi/util/exnet"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/log"
 	"github.com/gofiber/fiber/v2/middleware/healthcheck"
@@ -83,12 +86,12 @@ const (
 	maxCheckDelay       = 30 * time.Minute
 
 	// 缓存相关
-	defaultCacheTTL = 60 * time.Second
+	defaultCacheTTL = 5 * time.Minute
 	minCacheTTL     = 10 * time.Second
 	maxCacheTTL     = 300 * time.Second
-	cleanupInterval = 5 * time.Minute
+	cleanupInterval = 30 * time.Second
 	maxCacheItems   = 10000 // 最大缓存条目数
-	maxItemSize     = 1024  // 单个缓存项的最大大小（字节）
+	maxItemSize     = 4096  // 单个缓存项的最大大小（字节）
 
 	// 统计相关
 	statsResetCron = "0 */6 * * *"
@@ -105,6 +108,32 @@ type VersionInfo struct {
 	BuildTime string `json:"build_time"`
 	GoVersion string `json:"go_version"`
 	GitCommit string `json:"git_commit"`
+}
+
+// CacheEntry 表示缓存条目的结构体
+type CacheEntry struct {
+	Key       string   `json:"key"`
+	Domain    string   `json:"domain"`
+	Type      string   `json:"type"`
+	TTL       int64    `json:"ttl"`        // 剩余TTL（秒）
+	CacheTime string   `json:"cache_time"` // 缓存时间
+	ExpireAt  string   `json:"expire_at"`  // 过期时间
+	Size      int      `json:"size"`       // 估算大小（字节）
+	Answers   []string `json:"answers"`    // 解析结果
+}
+
+// CacheInfo 表示缓存信息的结构体
+type CacheInfo struct {
+	Summary struct {
+		TotalItems    int     `json:"total_items"`
+		TotalSize     int64   `json:"total_size"`   // 总大小（字节）
+		MemoryUsage   float64 `json:"memory_usage"` // 内存使用率
+		Hits          int64   `json:"hits"`
+		Misses        int64   `json:"misses"`
+		HitRate       float64 `json:"hit_rate"`
+		LastResetTime string  `json:"last_reset_time"`
+	} `json:"summary"`
+	Items []CacheEntry `json:"items"`
 }
 
 func init() {
@@ -421,7 +450,7 @@ func handle(c *fiber.Ctx) error {
 	if c.Method() == "GET" {
 		dnsParam := c.Query("dns")
 		if dnsParam == "" {
-			return c.Redirect("/", 302)
+			return c.Redirect("/deepseek", 302)
 		}
 		dnsMsg, err = base64.RawURLEncoding.DecodeString(dnsParam)
 		if err != nil {
@@ -505,7 +534,7 @@ func getCacheKey(msg *dns.Msg) string {
 		return ""
 	}
 	q := msg.Question[0]
-	return fmt.Sprintf("%s-%d-%t", q.Name, q.Qtype, msg.RecursionDesired)
+	return fmt.Sprintf("%d@%s", q.Qtype, q.Name)
 }
 
 // 从缓存获取响应
@@ -977,9 +1006,123 @@ func handleVersion(c *fiber.Ctx) error {
 	})
 }
 
+func handleCacheInfo(c *fiber.Ctx) error {
+	cacheInfo := CacheInfo{}
+	items := dnsCache.Items()
+
+	// 填充摘要信息
+	var validItems int
+	for _, item := range items {
+		if !item.Expired() {
+			validItems++
+		}
+	}
+
+	// 基础统计信息
+	cacheInfo.Summary.TotalItems = validItems
+	cacheInfo.Summary.Hits = atomic.LoadInt64(&cacheHits)
+	cacheInfo.Summary.Misses = atomic.LoadInt64(&cacheMisses)
+	total := cacheInfo.Summary.Hits + cacheInfo.Summary.Misses
+	if total > 0 {
+		cacheInfo.Summary.HitRate = float64(cacheInfo.Summary.Hits) / float64(total) * 100
+	}
+	cacheInfo.Summary.LastResetTime = statsResetTime.Format("2006-01-02 15:04:05")
+
+	// 如果请求详细信息，则填充缓存条目
+	// 预分配切片以提高性能
+	cacheInfo.Items = make([]CacheEntry, 0, validItems)
+
+	for k, item := range items {
+		// 跳过已过期的条目
+		if item.Expired() {
+			continue
+		}
+
+		if entry, ok := item.Object.(*struct {
+			Response  *dns.Msg
+			CacheTime time.Time
+		}); ok {
+			// 解析缓存键：格式为 "{Qtype}@{Name}"
+			parts := strings.SplitN(k, "@", 2)
+			if len(parts) != 2 {
+				continue
+			}
+
+			qtype, _ := strconv.Atoi(parts[0])
+			domain := parts[1]
+
+			// 计算剩余TTL
+			remainingTTL := int64(item.Expiration - time.Now().Unix())
+			if remainingTTL < 0 {
+				continue
+			}
+
+			// 获取解析结果
+			var answers []string
+			for _, ans := range entry.Response.Answer {
+				answers = append(answers, ans.String())
+			}
+
+			// 估算大小
+			size := estimateResponseSize(entry.Response)
+			cacheInfo.Summary.TotalSize += int64(size)
+
+			cacheEntry := CacheEntry{
+				Key:       k,
+				Domain:    domain,
+				Type:      dnsTypeToString(uint16(qtype)),
+				TTL:       remainingTTL,
+				CacheTime: entry.CacheTime.Format("2006-01-02 15:04:05"),
+				ExpireAt:  time.Unix(0, item.Expiration).Format("2006-01-02 15:04:05"),
+				Size:      size,
+				Answers:   answers,
+			}
+
+			cacheInfo.Items = append(cacheInfo.Items, cacheEntry)
+		}
+	}
+
+	// 计算内存使用率
+	if maxCacheItems > 0 {
+		cacheInfo.Summary.MemoryUsage = float64(validItems) / float64(maxCacheItems) * 100
+	}
+
+	// 按过期时间排序
+	sort.Slice(cacheInfo.Items, func(i, j int) bool {
+		return cacheInfo.Items[i].TTL < cacheInfo.Items[j].TTL
+	})
+
+	return c.JSON(cacheInfo)
+}
+
+func getRealIP(c *fiber.Ctx) string {
+	if ip := c.Get("CF-Connecting-IP"); ip != "" {
+		return ip
+	}
+	if ip := c.Get("True-Client-IP"); ip != "" {
+		return ip
+	}
+	if ip := c.Get("X-Real-IP"); ip != "" {
+		return ip
+	}
+	if forwarded := c.Get("X-Forwarded-For"); forwarded != "" {
+		ips := strings.Split(forwarded, ",")
+		for _, ip := range ips {
+			ip = strings.TrimSpace(ip)
+			if ip != "" && !exnet.IsPrivateNetIP(net.ParseIP(ip)) {
+				return ip
+			}
+		}
+	}
+	return c.IP()
+}
+
 func main() {
 	app := fiber.New(fiber.Config{
 		ServerHeader: "Caddy",
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			return c.Redirect("/deepseek", 302)
+		},
 	})
 	app.Use(requestid.New())
 	app.Use(logger.New(logger.Config{
@@ -991,7 +1134,7 @@ func main() {
 		LivenessProbe: func(c *fiber.Ctx) bool {
 			return true
 		},
-		LivenessEndpoint: "/",
+		LivenessEndpoint: "/pong",
 		ReadinessProbe: func(c *fiber.Ctx) bool {
 			return true
 		},
@@ -1003,19 +1146,27 @@ func main() {
 	app.Post("/dns-query", handle)
 	app.Get("/dnspod", handle)
 	app.Post("/dnspod", handle)
-	// 添加新的状态查询接口
-	app.Get("/status", handleStatus)
-
-	// 添加手动触发健康检查的接口
-	app.Post("/check", handleManualCheck)
-
-	// 添加重置统计的接口
-	app.Post("/reset", handleResetStats)
+	app.Get("/", handle)
+	app.Post("/", handle)
 
 	// 添加版本接口
 	app.Get("/version", handleVersion)
 
-	// 创建关闭信号通道
+	app.Route("/debug", func(router fiber.Router) {
+		// 添加缓存信息接口
+		router.Get("/cache", handleCacheInfo)
+		// 添加重置统计的接口
+		router.Post("/reset", handleResetStats)
+		// 添加手动触发健康检查的接口
+		router.Post("/check", handleManualCheck)
+		// 添加新的状态查询接口
+		router.Get("/status", handleStatus)
+	})
+
+	app.All("/deepseek", func(c *fiber.Ctx) error {
+		return c.SendString("ip: " + getRealIP(c))
+	})
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 
