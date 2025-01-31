@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"net"
 	"os"
 	"os/signal"
 	"runtime"
@@ -28,7 +29,14 @@ import (
 )
 
 var dnsClient = &dns.Client{
-	Timeout: 3 * time.Second,
+	Timeout:      queryTimeout,
+	ReadTimeout:  queryTimeout,
+	WriteTimeout: queryTimeout,
+	Dialer: &net.Dialer{
+		Timeout:   queryTimeout,
+		KeepAlive: 30 * time.Second,
+	},
+	SingleInflight: true,
 }
 
 // DNSServer 表示一个上游DNS服务器的配置和状态
@@ -54,7 +62,7 @@ var (
 	statsResetTime  time.Time // 统计重置时间
 
 	// 版本信息变量,通过编译时注入
-	AppVersion = "1.0.1"
+	AppVersion = "1.0.2"
 	BuildTime  = "unknown"
 	GitCommit  = ""
 	GoVersion  = runtime.Version()
@@ -141,16 +149,18 @@ func (s *DNSServer) updateStatus(latency time.Duration, err error) {
 
 	if err != nil {
 		s.failCount++
-		// 移除 failCount >= 2 的判断，直接标记为不可用
 		s.isAvailable = false
 		s.weight = minWeight
 
-		// 计算下次检查延迟，保持与 checkServer 一致的逻辑
+		// 计算下次检查延迟
 		delay := time.Duration(s.failCount) * baseCheckDelay
 		if delay > maxCheckDelay {
 			delay = maxCheckDelay
 		}
 		s.nextCheck = time.Now().Add(delay)
+
+		log.Warnf("服务器状态更新 - 地址: %s, 错误: %v, 连续失败次数: %d",
+			s.addr, err, s.failCount)
 	} else {
 		if !s.isAvailable {
 			log.Infof("服务器恢复可用: %s", s.addr)
@@ -160,7 +170,7 @@ func (s *DNSServer) updateStatus(latency time.Duration, err error) {
 		s.failCount = 0
 		s.nextCheck = time.Now().Add(healthCheckInterval)
 
-		// 更新平均延迟（使用指数移动平均）
+		// 更新平均延迟
 		alpha := 0.2
 		newLatency := float64(latency.Milliseconds())
 		if s.avgLatency == 0 {
@@ -169,6 +179,9 @@ func (s *DNSServer) updateStatus(latency time.Duration, err error) {
 			s.avgLatency = alpha*newLatency + (1-alpha)*s.avgLatency
 		}
 		s.weight = s.calculateWeight(s.avgLatency)
+
+		log.Infof("服务器状态更新成功 - 地址: %s, 延迟: %v, 当前权重: %.2f",
+			s.addr, latency, s.weight)
 	}
 }
 
@@ -257,8 +270,7 @@ func checkAllServers(ignoreNextCheck bool) {
 	msg.SetQuestion(healthCheckDomain, dns.TypeA)
 	msg.RecursionDesired = true
 
-	// 使用信号量限制并发
-	sem := make(chan struct{}, 4) // 最多4个并发检查
+	sem := make(chan struct{}, 8)
 	var wg sync.WaitGroup
 
 	serverMu.RLock()
@@ -266,8 +278,8 @@ func checkAllServers(ignoreNextCheck bool) {
 		wg.Add(1)
 		go func(s *DNSServer) {
 			defer wg.Done()
-			sem <- struct{}{}        // 获取信号量
-			defer func() { <-sem }() // 释放信号量
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			checkServer(ctx, s, msg, ignoreNextCheck)
 		}(server)
 	}
@@ -376,7 +388,7 @@ func logHealthCheckResults() {
 		server.mu.RUnlock()
 	}
 
-	log.Infof("健康检查结果：可用=%d 不可用=%d 总权重=%.2f\n详细信息：%+v",
+	log.Debugf("健康检查结果：可用=%d 不可用=%d 总权重=%.2f\n详细信息：%+v",
 		stats.Available, stats.Unavailable, stats.TotalWeight, stats.Servers)
 }
 
@@ -399,6 +411,7 @@ func startStatsReset() {
 
 	// 启动cron
 	c.Start()
+	defer c.Stop()
 }
 
 func main() {
