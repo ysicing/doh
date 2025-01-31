@@ -414,73 +414,6 @@ func startStatsReset() {
 	defer c.Stop()
 }
 
-func main() {
-	app := fiber.New(fiber.Config{
-		ServerHeader: "Caddy",
-	})
-	app.Use(requestid.New())
-	app.Use(logger.New(logger.Config{
-		Format:     "${time} ${locals:requestid} ${ip} ${ua} - ${method} ${status} ${host} ${path} ${latency}\n",
-		TimeFormat: "2006-01-02 15:04:05",
-		TimeZone:   "Asia/Shanghai",
-	}))
-	app.Use(healthcheck.New(healthcheck.Config{
-		LivenessProbe: func(c *fiber.Ctx) bool {
-			return true
-		},
-		LivenessEndpoint: "/",
-		ReadinessProbe: func(c *fiber.Ctx) bool {
-			return true
-		},
-		ReadinessEndpoint: "/ping",
-	}))
-	app.Get("/metrics", monitor.New(monitor.Config{Title: "Caddy Metrics"}))
-
-	app.Get("/dns-query", handle)
-	app.Post("/dns-query", handle)
-	app.Get("/dnspod", handle)
-	app.Post("/dnspod", handle)
-
-	// 添加新的状态查询接口
-	app.Get("/status", handleStatus)
-
-	// 添加手动触发健康检查的接口
-	app.Post("/check", handleManualCheck)
-
-	// 添加重置统计的接口
-	app.Post("/reset", handleResetStats)
-
-	// 添加版本接口
-	app.Get("/version", handleVersion)
-
-	// 创建关闭信号通道
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
-
-	go func() {
-		<-quit
-		log.Info("正在关闭服务器...")
-
-		// 设置关闭超时
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		if err := app.ShutdownWithContext(ctx); err != nil {
-			log.Error("服务器关闭出错:", err)
-		}
-	}()
-
-	// 启动健康检查
-	startHealthCheck()
-
-	// 启动统计自动重置
-	startStatsReset()
-
-	if err := app.Listen(":65001"); err != nil {
-		log.Error("服务器启动失败:", err)
-	}
-}
-
 func handle(c *fiber.Ctx) error {
 	var dnsMsg []byte
 	var err error
@@ -1042,4 +975,70 @@ func handleVersion(c *fiber.Ctx) error {
 		GoVersion: GoVersion,
 		GitCommit: GitCommit,
 	})
+}
+
+func main() {
+	app := fiber.New(fiber.Config{
+		ServerHeader: "Caddy",
+	})
+	app.Use(requestid.New())
+	app.Use(logger.New(logger.Config{
+		Format:     "${time} ${locals:requestid} ${ip} ${ua} - ${method} ${status} ${host} ${path} ${latency}\n",
+		TimeFormat: "2006-01-02 15:04:05",
+		TimeZone:   "Asia/Shanghai",
+	}))
+	app.Use(healthcheck.New(healthcheck.Config{
+		LivenessProbe: func(c *fiber.Ctx) bool {
+			return true
+		},
+		LivenessEndpoint: "/",
+		ReadinessProbe: func(c *fiber.Ctx) bool {
+			return true
+		},
+		ReadinessEndpoint: "/ping",
+	}))
+	app.Get("/metrics", monitor.New(monitor.Config{Title: "Caddy Metrics"}))
+
+	app.Get("/dns-query", handle)
+	app.Post("/dns-query", handle)
+	app.Get("/dnspod", handle)
+	app.Post("/dnspod", handle)
+	// 添加新的状态查询接口
+	app.Get("/status", handleStatus)
+
+	// 添加手动触发健康检查的接口
+	app.Post("/check", handleManualCheck)
+
+	// 添加重置统计的接口
+	app.Post("/reset", handleResetStats)
+
+	// 添加版本接口
+	app.Get("/version", handleVersion)
+
+	// 创建关闭信号通道
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-quit
+		log.Info("正在关闭服务器...")
+
+		// 设置关闭超时
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if err := app.ShutdownWithContext(ctx); err != nil {
+			log.Error("服务器关闭出错:", err)
+		}
+	}()
+
+	// 启动健康检查
+	startHealthCheck()
+
+	// 启动统计自动重置
+	startStatsReset()
+
+	if err := app.Listen(":65001"); err != nil {
+		log.Error("服务器启动失败:", err)
+	}
 }
