@@ -54,7 +54,7 @@ var (
 	statsResetTime  time.Time // 统计重置时间
 
 	// 版本信息变量,通过编译时注入
-	AppVersion = "1.0.0"
+	AppVersion = "1.0.1"
 	BuildTime  = "unknown"
 	GitCommit  = ""
 	GoVersion  = runtime.Version()
@@ -479,25 +479,74 @@ func handle(c *fiber.Ctx) error {
 		}
 		dnsMsg, err = base64.RawURLEncoding.DecodeString(dnsParam)
 		if err != nil {
-			return c.Redirect("/", 302)
+			log.Warnf("base64解码失败: %v", err)
+			return c.Status(400).JSON(fiber.Map{
+				"error": "请求参数无效",
+			})
 		}
 	} else {
 		dnsMsg = c.Body()
 	}
 
+	// 添加消息大小检查
+	if len(dnsMsg) > 4096 {
+		log.Warnf("消息过大: %d bytes", len(dnsMsg))
+		return c.Status(400).JSON(fiber.Map{
+			"error": "请求数据过大",
+		})
+	}
+
 	msg := new(dns.Msg)
 	if err := msg.Unpack(dnsMsg); err != nil {
-		return c.Status(400).SendString("panic pack data")
+		log.Warnf("消息解析失败: %v", err)
+		return c.Status(400).JSON(fiber.Map{
+			"error": "请求格式无效",
+		})
 	}
+
+	if len(msg.Question) == 0 {
+		log.Warn("查询没有Question段")
+		return c.Status(400).JSON(fiber.Map{
+			"error": "请求格式无效",
+		})
+	}
+
+	msg.SetEdns0(4096, false)
 
 	resp, err := forwardToUpstreamDNS(msg)
 	if err != nil {
-		return c.Status(500).SendString("panic forward data")
+		log.Errorf("查询失败: %v", err)
+		return c.Status(500).JSON(fiber.Map{
+			"error": "服务暂时不可用",
+		})
 	}
+
+	if resp == nil {
+		log.Error("收到空响应")
+		return c.Status(500).JSON(fiber.Map{
+			"error": "服务暂时不可用",
+		})
+	}
+
+	resp.Id = msg.Id
 
 	packed, err := resp.Pack()
 	if err != nil {
-		return c.Status(500).SendString("panic pack response data")
+		log.Errorf("响应打包失败: %v", err)
+		return c.Status(500).JSON(fiber.Map{
+			"error": "服务暂时不可用",
+		})
+	}
+
+	if len(packed) > 4096 {
+		log.Warnf("响应过大: %d bytes", len(packed))
+		resp.Truncate(4096)
+		packed, err = resp.Pack()
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{
+				"error": "服务暂时不可用",
+			})
+		}
 	}
 
 	c.Set("Content-Type", "application/dns-message")
@@ -706,6 +755,9 @@ func forwardToUpstreamDNS(msg *dns.Msg) (*dns.Msg, error) {
 		return nil, fmt.Errorf("无效的DNS查询：空的Question段")
 	}
 
+	// 添加大小限制
+	msg.SetEdns0(4096, false)
+
 	// 首先尝试从缓存获取
 	if cachedResp := getFromCache(msg); cachedResp != nil {
 		return cachedResp, nil
@@ -721,11 +773,9 @@ func forwardToUpstreamDNS(msg *dns.Msg) (*dns.Msg, error) {
 		err     error
 		server  string
 		latency time.Duration
-		retries int // 添加重试次数记录
 	}
 	responses := make(chan dnsResponse, len(servers))
-	done := make(chan struct{})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), totalTimeout)
 	defer cancel()
 
 	for _, server := range servers {
@@ -733,46 +783,52 @@ func forwardToUpstreamDNS(msg *dns.Msg) (*dns.Msg, error) {
 			start := time.Now()
 			resp, rtt, err := server.query(msg, ctx)
 
-			// 更新服务器状态
+			// 验证响应
+			if err == nil && resp != nil {
+				// 检查响应大小
+				if packed, err := resp.Pack(); err == nil && len(packed) > 4096 {
+					resp.Truncate(4096)
+				}
+			}
+
 			server.updateStatus(rtt, err)
 
 			select {
 			case <-ctx.Done():
-				return
-			case <-done:
 				return
 			case responses <- dnsResponse{
 				resp:    resp,
 				err:     err,
 				server:  server.addr,
 				latency: time.Since(start),
-				retries: 0, // 初始重试次数为0
 			}:
 			}
 		}(server)
 	}
 
-	var errors []error
+	var lastError error
 	for i := 0; i < len(servers); i++ {
 		response := <-responses
-		if response.err == nil {
-			log.Infof("使用dns %s 查询域名: %s, 类型: %s, 延迟: %v\n",
+		if response.err == nil && response.resp != nil {
+			log.Infof("DNS查询成功 - 服务器: %s, 域名: %s, 类型: %s, 延迟: %v",
 				response.server,
 				msg.Question[0].Name,
 				dnsTypeToString(msg.Question[0].Qtype),
 				response.latency)
 
-			// 添加到缓存
 			addToCache(msg, response.resp)
 			return response.resp, nil
 		}
-		errors = append(errors, fmt.Errorf("%s: %v", response.server, response.err))
+		lastError = response.err
 	}
 
-	return nil, fmt.Errorf("所有DNS服务器查询失败：%v", errors)
+	return nil, fmt.Errorf("所有DNS服务器查询失败，最后错误: %v", lastError)
 }
 
 func (s *DNSServer) query(msg *dns.Msg, ctx context.Context) (*dns.Msg, time.Duration, error) {
+	// 添加大小限制
+	msg.SetEdns0(4096, false)
+
 	var lastErr error
 	for retry := 0; retry <= maxRetries; retry++ {
 		select {
@@ -780,11 +836,14 @@ func (s *DNSServer) query(msg *dns.Msg, ctx context.Context) (*dns.Msg, time.Dur
 			return nil, 0, ctx.Err()
 		default:
 			resp, rtt, err := dnsClient.Exchange(msg, s.addr)
-			if err == nil {
+			if err == nil && resp != nil {
+				// 验证响应
+				if packed, err := resp.Pack(); err == nil && len(packed) > 4096 {
+					resp.Truncate(4096)
+				}
 				return resp, rtt, nil
 			}
 			lastErr = err
-			// 使用指数退避
 			backoff := time.Duration(math.Pow(2, float64(retry))) * 50 * time.Millisecond
 			if backoff > time.Second {
 				backoff = time.Second
