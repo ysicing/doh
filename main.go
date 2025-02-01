@@ -323,6 +323,12 @@ func checkAllServers(ignoreNextCheck bool) {
 // checkServer 检查单个服务器的健康状态
 // ignoreNextCheck 为 true 时忽略 nextCheck 时间限制
 func checkServer(ctx context.Context, server *DNSServer, msg *dns.Msg, ignoreNextCheck bool) {
+	// 添加消息有效性检查
+	if msg == nil || len(msg.Question) == 0 {
+		log.Warn("健康检查:无效的DNS查询消息")
+		return
+	}
+
 	server.mu.Lock()
 	if !ignoreNextCheck && !time.Now().After(server.nextCheck) {
 		server.mu.Unlock()
@@ -330,7 +336,7 @@ func checkServer(ctx context.Context, server *DNSServer, msg *dns.Msg, ignoreNex
 	}
 	server.mu.Unlock()
 
-	_, rtt, err := server.query(msg, ctx)
+	_, rtt, err := server.query(msg.Copy(), ctx) // 使用消息的副本
 	server.updateStatus(rtt, err)
 }
 
@@ -758,6 +764,16 @@ func forwardToUpstreamDNS(msg *dns.Msg) (*dns.Msg, error) {
 }
 
 func (s *DNSServer) query(msg *dns.Msg, ctx context.Context) (*dns.Msg, time.Duration, error) {
+	// 添加消息有效性检查
+	if msg == nil {
+		return nil, 0, fmt.Errorf("无效的DNS查询消息")
+	}
+
+	// 确保消息中包含Question
+	if len(msg.Question) == 0 {
+		return nil, 0, fmt.Errorf("DNS查询消息中没有Question段")
+	}
+
 	// 添加大小限制
 	msg.SetEdns0(4096, false)
 
