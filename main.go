@@ -190,11 +190,11 @@ func (s *DNSServer) updateStatus(latency time.Duration, err error) {
 		}
 		s.nextCheck = time.Now().Add(delay)
 
-		log.Warnf("服务器状态更新 - 地址: %s, 错误: %v, 连续失败次数: %d",
+		log.Warnf("上游DNS %s 探测失败, 错误: %v, 连续失败次数: %d",
 			s.addr, err, s.failCount)
 	} else {
 		if !s.isAvailable {
-			log.Infof("服务器恢复可用: %s", s.addr)
+			log.Infof("上游DNS %s 恢复", s.addr)
 		}
 
 		s.isAvailable = true
@@ -211,7 +211,7 @@ func (s *DNSServer) updateStatus(latency time.Duration, err error) {
 		}
 		s.weight = s.calculateWeight(s.avgLatency)
 
-		log.Infof("服务器状态更新成功 - 地址: %s, 延迟: %v, 当前权重: %.2f",
+		log.Infof("上游DNS %s, 延迟: %v, 当前权重: %.2f",
 			s.addr, latency, s.weight)
 	}
 }
@@ -324,7 +324,6 @@ func checkAllServers(ignoreNextCheck bool) {
 // ignoreNextCheck 为 true 时忽略 nextCheck 时间限制
 func checkServer(ctx context.Context, server *DNSServer, msg *dns.Msg, ignoreNextCheck bool) {
 	server.mu.Lock()
-	// 简化判断：只要当前时间超过了 nextCheck，就执行检查
 	if !ignoreNextCheck && !time.Now().After(server.nextCheck) {
 		server.mu.Unlock()
 		return
@@ -332,51 +331,7 @@ func checkServer(ctx context.Context, server *DNSServer, msg *dns.Msg, ignoreNex
 	server.mu.Unlock()
 
 	_, rtt, err := server.query(msg, ctx)
-
-	server.mu.Lock()
-	defer server.mu.Unlock()
-
-	if err != nil {
-		server.failCount++
-		log.Warnf("健康检查失败 - 服务器: %s, 错误: %v, 连续失败次数: %d",
-			server.addr, err, server.failCount)
-
-		server.isAvailable = false
-		server.weight = minWeight
-		log.Errorf("服务器已标记为不可用: %s", server.addr)
-
-		// 计算下次检查延迟
-		delay := time.Duration(server.failCount) * baseCheckDelay
-		if delay > maxCheckDelay {
-			delay = maxCheckDelay
-		}
-		server.nextCheck = time.Now().Add(delay)
-
-		log.Infof("服务器 %s 下次检查时间延后 %v", server.addr, delay)
-	} else {
-		if !server.isAvailable {
-			log.Infof("服务器恢复可用: %s", server.addr)
-		}
-
-		server.isAvailable = true
-		server.failCount = 0
-		server.nextCheck = time.Now().Add(healthCheckInterval)
-
-		// 更新平均延迟
-		alpha := 0.2
-		newLatency := float64(rtt.Milliseconds())
-		if server.avgLatency == 0 {
-			server.avgLatency = newLatency
-		} else {
-			server.avgLatency = alpha*newLatency + (1-alpha)*server.avgLatency
-		}
-		server.weight = server.calculateWeight(server.avgLatency)
-
-		log.Infof("健康检查成功 - 服务器: %s, 延迟: %v, 当前权重: %.2f",
-			server.addr, rtt, server.weight)
-	}
-
-	server.lastCheck = time.Now()
+	server.updateStatus(rtt, err)
 }
 
 func logHealthCheckResults() {
