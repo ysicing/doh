@@ -15,7 +15,7 @@ tasks:
       APP_VERSION:
         sh: git describe --tags --always
       BUILD_TIME:
-        sh: date -u +%Y-%m-%dT%H:%M:%SZ
+        sh: date +%Y-%m-%dT%H:%M:%SZ
     cmds:
       - go build -trimpath -o doh -ldflags \
         "-w -s -X main.GitCommit={{.GIT_COMMIT}} -X main.AppVersion={{.APP_VERSION}} -X main.BuildTime={{.BUILD_TIME}}"

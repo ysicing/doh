@@ -109,6 +109,8 @@ type VersionInfo struct {
 	BuildTime string `json:"build_time"`
 	GoVersion string `json:"go_version"`
 	GitCommit string `json:"git_commit"`
+	Platform  string `json:"platform,omitempty"`
+	Node      string `json:"node,omitempty"`
 }
 
 // CacheEntry 表示缓存条目的结构体
@@ -978,6 +980,8 @@ func handleVersion(c *fiber.Ctx) error {
 		BuildTime: BuildTime,
 		GoVersion: GoVersion,
 		GitCommit: GitCommit,
+		Platform:  runtime.GOOS + "/" + runtime.GOARCH,
+		Node:      environ.GetEnv("NODE_IP", "unknown"),
 	})
 }
 
