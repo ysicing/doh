@@ -28,6 +28,14 @@ tasks:
     cmds:
       - docker buildx build --platform linux/amd64,linux/arm64 --push --pull -t ghcr.io/ysicing/doh -t ghcr.io/ysicing/doh:{{.TAG}} -t ysicing/doh:{{.TAG}} -t ysicing/doh .
 
+  ghcr:
+    desc: push to ghcr
+    vars:
+      TAG:
+        sh: git describe --tags --always
+    cmds:
+      - docker buildx build --platform linux/amd64,linux/arm64 --push --pull -t ghcr.io/ysicing/doh -t ghcr.io/ysicing/doh:{{.TAG}} .
+
   trivy:
     desc: scan docker image
     deps:
