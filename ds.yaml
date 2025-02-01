@@ -50,6 +50,11 @@ spec:
           requests:
             cpu: 100m
             memory: 200Mi
+        env:
+        - name: NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
 ---
 apiVersion: v1
 kind: Service

@@ -926,7 +926,7 @@ func handleStatus(c *fiber.Ctx) error {
 	status.Cache.ItemCount = int64(dnsCache.ItemCount())
 	status.Cache.Hits = hits
 	status.Cache.Misses = misses
-	status.Cache.Node = environ.GetEnv("NODE_NAME", "unknown")
+	status.Cache.Node = environ.GetEnv("NODE_IP", "unknown")
 	if total > 0 {
 		status.Cache.HitRate = float64(hits) / float64(total) * 100
 	}
@@ -1023,7 +1023,7 @@ func handleCacheInfo(c *fiber.Ctx) error {
 	}
 
 	// 基础统计信息
-	cacheInfo.Summary.Node = environ.GetEnv("NODE_NAME", "unknown")
+	cacheInfo.Summary.Node = environ.GetEnv("NODE_IP", "unknown")
 	cacheInfo.Summary.TotalItems = validItems
 	cacheInfo.Summary.Hits = atomic.LoadInt64(&cacheHits)
 	cacheInfo.Summary.Misses = atomic.LoadInt64(&cacheMisses)
