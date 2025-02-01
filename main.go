@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ergoapi/util/environ"
 	"github.com/ergoapi/util/exnet"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/log"
@@ -132,6 +133,7 @@ type CacheInfo struct {
 		Misses        int64   `json:"misses"`
 		HitRate       float64 `json:"hit_rate"`
 		LastResetTime string  `json:"last_reset_time"`
+		Node          string  `json:"node,omitempty"`
 	} `json:"summary"`
 	Items []CacheEntry `json:"items"`
 }
@@ -875,11 +877,12 @@ type SystemStatus struct {
 	Servers []ServerStatus `json:"servers"`
 	// 缓存统计
 	Cache struct {
-		ItemCount int64   `json:"item_count"` // 当前缓存项数量
-		Hits      int64   `json:"hits"`       // 命中次数
-		Misses    int64   `json:"misses"`     // 未命中次数
-		HitRate   float64 `json:"hit_rate"`   // 命中率
-		ResetTime string  `json:"reset_time"` // 上次重置时间
+		ItemCount int64   `json:"item_count"`     // 当前缓存项数量
+		Hits      int64   `json:"hits"`           // 命中次数
+		Misses    int64   `json:"misses"`         // 未命中次数
+		HitRate   float64 `json:"hit_rate"`       // 命中率
+		ResetTime string  `json:"reset_time"`     // 上次重置时间
+		Node      string  `json:"node,omitempty"` // 节点名称
 	} `json:"cache"`
 }
 
@@ -923,6 +926,7 @@ func handleStatus(c *fiber.Ctx) error {
 	status.Cache.ItemCount = int64(dnsCache.ItemCount())
 	status.Cache.Hits = hits
 	status.Cache.Misses = misses
+	status.Cache.Node = environ.GetEnv("NODE_NAME", "unknown")
 	if total > 0 {
 		status.Cache.HitRate = float64(hits) / float64(total) * 100
 	}
@@ -1019,6 +1023,7 @@ func handleCacheInfo(c *fiber.Ctx) error {
 	}
 
 	// 基础统计信息
+	cacheInfo.Summary.Node = environ.GetEnv("NODE_NAME", "unknown")
 	cacheInfo.Summary.TotalItems = validItems
 	cacheInfo.Summary.Hits = atomic.LoadInt64(&cacheHits)
 	cacheInfo.Summary.Misses = atomic.LoadInt64(&cacheMisses)
