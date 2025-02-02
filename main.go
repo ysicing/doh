@@ -1119,9 +1119,21 @@ func main() {
 	})
 	app.Use(requestid.New())
 	app.Use(logger.New(logger.Config{
-		Format:     "${time} ${locals:requestid} ${ip} ${ua} - ${method} ${status} ${host} ${path} ${latency}\n",
+		Format:     "${time} ${locals:requestid} ${clientip} ${ua} - ${method} ${status} ${host} ${path} ${latency}\n",
 		TimeFormat: "2006-01-02 15:04:05",
 		TimeZone:   "Asia/Shanghai",
+		CustomTags: map[string]logger.LogFunc{
+			"clientip": func(output logger.Buffer, c *fiber.Ctx, data *logger.Data, extraParam string) (int, error) {
+				return output.WriteString(getRealIP(c))
+			},
+		},
+		Next: func(c *fiber.Ctx) bool {
+			ua := strings.ToLower(c.Get("User-Agent"))
+			if strings.Contains(ua, "kube-probe") || strings.Contains(ua, "uptime-kuma") {
+				return true
+			}
+			return false
+		},
 	}))
 	app.Use(healthcheck.New(healthcheck.Config{
 		LivenessProbe: func(c *fiber.Ctx) bool {
