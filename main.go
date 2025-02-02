@@ -1127,11 +1127,11 @@ func main() {
 		LivenessProbe: func(c *fiber.Ctx) bool {
 			return true
 		},
-		LivenessEndpoint: "/pong",
+		LivenessEndpoint: "/live",
 		ReadinessProbe: func(c *fiber.Ctx) bool {
 			return true
 		},
-		ReadinessEndpoint: "/ping",
+		ReadinessEndpoint: "/ready",
 	}))
 	app.Get("/metrics", monitor.New(monitor.Config{Title: "Caddy Metrics"}))
 

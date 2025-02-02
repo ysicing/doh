@@ -50,6 +50,18 @@ spec:
           requests:
             cpu: 100m
             memory: 200Mi
+        livenessProbe:
+          httpGet:
+            path: /live
+            port: 65001
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 65001
+          initialDelaySeconds: 5
+          periodSeconds: 10
         env:
         - name: NODE_IP
           valueFrom:
