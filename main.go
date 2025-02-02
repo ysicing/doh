@@ -776,8 +776,16 @@ func (s *DNSServer) query(msg *dns.Msg, ctx context.Context) (*dns.Msg, time.Dur
 		return nil, 0, fmt.Errorf("DNS查询消息中没有Question段")
 	}
 
-	// 添加大小限制
-	msg.SetEdns0(4096, false)
+	// 创建消息副本以避免修改原始消息
+	queryMsg := msg.Copy()
+	if queryMsg == nil {
+		return nil, 0, fmt.Errorf("无法创建DNS消息副本")
+	}
+
+	// 添加EDNS0支持
+	if queryMsg.IsEdns0() == nil {
+		queryMsg.SetEdns0(4096, false)
+	}
 
 	var lastErr error
 	for retry := 0; retry <= maxRetries; retry++ {
@@ -785,9 +793,14 @@ func (s *DNSServer) query(msg *dns.Msg, ctx context.Context) (*dns.Msg, time.Dur
 		case <-ctx.Done():
 			return nil, 0, ctx.Err()
 		default:
-			resp, rtt, err := dnsClient.Exchange(msg, s.addr)
+			resp, rtt, err := dnsClient.Exchange(queryMsg, s.addr)
 			if err == nil && resp != nil {
 				// 验证响应
+				if resp.IsEdns0() == nil {
+					resp.SetEdns0(4096, false)
+				}
+
+				// 验证响应大小
 				if packed, err := resp.Pack(); err == nil && len(packed) > 4096 {
 					resp.Truncate(4096)
 				}
