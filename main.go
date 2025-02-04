@@ -95,7 +95,7 @@ const (
 	maxItemSize     = 4096  // 单个缓存项的最大大小（字节）
 
 	// 统计相关
-	statsResetCron = "0 */6 * * *"
+	statsResetCron = "0 0 * * 0"
 
 	// 权重计算相关
 	baseWeight = 1000.0
@@ -388,7 +388,7 @@ func logHealthCheckResults() {
 
 // 启动统计自动重置
 func startStatsReset() {
-	c := cron.New(cron.WithLocation(time.Local)) // 使用本地时区
+	c := cron.New()
 
 	// 添加定时任务
 	_, err := c.AddFunc(statsResetCron, func() {
@@ -403,9 +403,7 @@ func startStatsReset() {
 		return
 	}
 
-	// 启动cron
 	c.Start()
-	defer c.Stop()
 }
 
 func handle(c *fiber.Ctx) error {
@@ -932,7 +930,7 @@ func handleManualCheck(c *fiber.Ctx) error {
 
 // 添加重置统计的接口
 func handleResetStats(c *fiber.Ctx) error {
-	action := c.Query("action", "reset") // 默认为reset操作
+	action := c.Query("action", "all")
 
 	switch action {
 	case "reset":
