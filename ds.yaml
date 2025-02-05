@@ -37,6 +37,16 @@ spec:
       hostNetwork: true
       nodeSelector:
         node-role.kubernetes.io/nogfw-ipv6: "true"
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node-role.kubernetes.io/jp
+                operator: Exists
+            - matchExpressions:
+              - key: node-role.kubernetes.io/hk
+                operator: Exists
       tolerations:
       - operator: Exists
         effect: NoSchedule
