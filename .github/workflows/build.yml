@@ -2,7 +2,7 @@ name: build
 
 env:
   # Common versions
-  GO_VERSION: '1.23'
+  GO_VERSION: "1.23"
   TZ: Asia/Shanghai
 
 permissions:
@@ -11,11 +11,11 @@ permissions:
 on:
   push:
     branches:
-      - '*'
+      - "*"
     paths:
-      - '**.go'
-      - 'go.mod'
-      - '.github/**'
+      - "**.go"
+      - "go.mod"
+      - ".github/**"
 
 jobs:
   build:

@@ -1,12 +1,11 @@
 # https://taskfile.dev
 
-version: '3'
+version: "3"
 
 vars:
   GREETING: Hello, World!
 
 tasks:
-
   build:
     desc: build doh binary
     vars:

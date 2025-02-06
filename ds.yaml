@@ -41,42 +41,42 @@ spec:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             nodeSelectorTerms:
-            - matchExpressions:
-              - key: node-role.kubernetes.io/jp
-                operator: Exists
-            - matchExpressions:
-              - key: node-role.kubernetes.io/hk
-                operator: Exists
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/jp
+                    operator: Exists
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/hk
+                    operator: Exists
       tolerations:
-      - operator: Exists
-        effect: NoSchedule
+        - operator: Exists
+          effect: NoSchedule
       containers:
-      - name: doh
-        image: ghcr.io/ysicing/doh:latest
-        imagePullPolicy: Always
-        resources:
-          limits:
-            memory: 200Mi
-          requests:
-            cpu: 100m
-            memory: 200Mi
-        livenessProbe:
-          httpGet:
-            path: /live
-            port: 65001
-          initialDelaySeconds: 15
-          periodSeconds: 20
-        readinessProbe:
-          httpGet:
-            path: /ready
-            port: 65001
-          initialDelaySeconds: 5
-          periodSeconds: 10
-        env:
-        - name: NODE_IP
-          valueFrom:
-            fieldRef:
-              fieldPath: status.hostIP
+        - name: doh
+          image: ghcr.io/ysicing/doh:latest
+          imagePullPolicy: Always
+          resources:
+            limits:
+              memory: 200Mi
+            requests:
+              cpu: 100m
+              memory: 200Mi
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 65001
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 65001
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          env:
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
 ---
 apiVersion: v1
 kind: Service
@@ -91,10 +91,10 @@ spec:
   type: LoadBalancer
   loadBalancerClass: tailscale
   ports:
-  - name: doh
-    protocol: TCP
-    port: 80
-    targetPort: 65001
+    - name: doh
+      protocol: TCP
+      port: 80
+      targetPort: 65001
 # ---
 # apiVersion: traefik.io/v1alpha1
 # kind: Middleware
