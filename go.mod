@@ -6,8 +6,6 @@ require (
 	github.com/ergoapi/util v0.7.13
 	github.com/gofiber/fiber/v2 v2.52.6
 	github.com/miekg/dns v1.1.63
-	github.com/patrickmn/go-cache v2.1.0+incompatible
-	github.com/robfig/cron/v3 v3.0.1
 )
 
 require (

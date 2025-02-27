@@ -21,11 +21,8 @@ tasks:
 
   docker:
     desc: build docker image
-    vars:
-      TAG:
-        sh: git describe --tags --always
     cmds:
-      - docker buildx build --platform linux/amd64,linux/arm64 --push --pull -t ghcr.io/ysicing/doh -t ghcr.io/ysicing/doh:{{.TAG}} -t ysicing/doh:{{.TAG}} -t ysicing/doh .
+      - docker buildx build --platform linux/amd64,linux/arm64 --push --pull -t ghcr.io/ysicing/doh:china -t ysicing/doh:china .
 
   ghcr:
     desc: push to ghcr
@@ -33,14 +30,14 @@ tasks:
       TAG:
         sh: git describe --tags --always
     cmds:
-      - docker buildx build --platform linux/amd64,linux/arm64 --push --pull -t ghcr.io/ysicing/doh -t ghcr.io/ysicing/doh:{{.TAG}} .
+      - docker buildx build --platform linux/amd64,linux/arm64 --push --pull -t ghcr.io/ysicing/doh:china -t ghcr.io/ysicing/doh:{{.TAG}}-china .
 
   trivy:
     desc: scan docker image
     deps:
       - docker
     cmds:
-      - trivy image ghcr.io/ysicing/doh --scanners vuln
+      - trivy image ghcr.io/ysicing/doh:china --scanners vuln
 
   default:
     cmds:
