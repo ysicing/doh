@@ -4,7 +4,7 @@ go 1.23.5
 
 require (
 	github.com/ergoapi/util v0.8.4
-	github.com/gofiber/fiber/v2 v2.52.6
+	github.com/gofiber/fiber/v2 v2.52.8
 	github.com/miekg/dns v1.1.66
 	github.com/patrickmn/go-cache v2.1.0+incompatible
 	github.com/robfig/cron/v3 v3.0.1
