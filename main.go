@@ -58,15 +58,18 @@ type DNSServer struct {
 }
 
 var (
-	upstreamServers []*DNSServer
-	serverMu        sync.RWMutex
-	dnsCache        *cache.Cache
-	cacheHits       int64     // 缓存命中次数
-	cacheMisses     int64     // 缓存未命中次数
-	statsResetTime  time.Time // 统计重置时间
+	upstreamServers   []*DNSServer
+	serverMu          sync.RWMutex
+	dnsCache          *cache.Cache
+	cacheHits         int64 // 缓存命中次数
+	cacheMisses       int64 // 缓存未命中次数
+	statsResetTime    atomic.Value
+	healthCheckTicker *time.Ticker
+	cronScheduler     *cron.Cron
+	monitorStopCh     chan struct{}
 
 	// 版本信息变量,通过编译时注入
-	AppVersion = "1.0.2"
+	AppVersion = "1.1.9"
 	BuildTime  = "unknown"
 	GitCommit  = ""
 	GoVersion  = runtime.Version()
@@ -79,7 +82,6 @@ const (
 	totalTimeout = 5 * time.Second
 
 	// 健康检查相关
-	healthTimeout       = 1 * time.Second
 	healthCheckInterval = 1 * time.Minute
 	healthCheckTimeout  = 2 * time.Second
 	healthCheckDomain   = "google.com."
@@ -88,11 +90,10 @@ const (
 
 	// 缓存相关
 	defaultCacheTTL = 5 * time.Minute
-	minCacheTTL     = 10 * time.Second
 	maxCacheTTL     = 300 * time.Second
 	cleanupInterval = 30 * time.Second
-	maxCacheItems   = 10000 // 最大缓存条目数
-	maxItemSize     = 4096  // 单个缓存项的最大大小（字节）
+	maxCacheItems   = 10000
+	maxItemSize     = 4096
 
 	// 统计相关
 	statsResetCron = "0 0 * * 0"
@@ -151,13 +152,11 @@ func init() {
 		newDNSServer("[2606:4700:4700::1111]:53", 98, true),
 		newDNSServer("[2606:4700:4700::1001]:53", 98, true),
 	}
-	rand.Seed(time.Now().UnixNano())
 	dnsCache = cache.New(defaultCacheTTL, cleanupInterval)
-	dnsCache.OnEvicted(func(key string, value interface{}) {
+	dnsCache.OnEvicted(func(key string, value any) {
 		log.Debugf("缓存条目已过期或被驱逐 - Key: %s", key)
 	})
-	go monitorCacheSize()
-	statsResetTime = time.Now()
+	statsResetTime.Store(time.Now())
 }
 
 func newDNSServer(addr string, priority int, isIPv6 bool) *DNSServer {
@@ -186,10 +185,7 @@ func (s *DNSServer) updateStatus(latency time.Duration, err error) {
 		s.weight = minWeight
 
 		// 计算下次检查延迟
-		delay := time.Duration(s.failCount) * baseCheckDelay
-		if delay > maxCheckDelay {
-			delay = maxCheckDelay
-		}
+		delay := min(time.Duration(s.failCount)*baseCheckDelay, maxCheckDelay)
 		s.nextCheck = time.Now().Add(delay)
 
 		log.Warnf("上游DNS %s 探测失败, 错误: %v, 连续失败次数: %d",
@@ -221,73 +217,48 @@ func (s *DNSServer) updateStatus(latency time.Duration, err error) {
 // 获取当前可用的服务器列表，使用加权随机算法选择
 func getAvailableServers() []*DNSServer {
 	serverMu.RLock()
-	defer serverMu.RUnlock()
 
-	var available []*DNSServer
-	var totalWeight float64
-
-	// 第一次遍历：收集可用服务器和计算总权重
-	for _, server := range upstreamServers {
-		server.mu.RLock()
-		if server.isAvailable {
-			available = append(available, server)
-			totalWeight += server.weight
-		}
-		server.mu.RUnlock()
+	// 一次性读取所有数据，避免排序时加锁
+	type serverSnapshot struct {
+		server   *DNSServer
+		priority int
+		weight   float64
 	}
+	var snapshots []serverSnapshot
 
-	// 按照权重随机排序
-	sort.Slice(available, func(i, j int) bool {
-		si, sj := available[i], available[j]
-		si.mu.RLock()
-		sj.mu.RLock()
-		defer si.mu.RUnlock()
-		defer sj.mu.RUnlock()
-
-		// 如果优先级不同，高优先级的始终排在前面
-		if si.priority != sj.priority {
-			return si.priority > sj.priority
+	for _, s := range upstreamServers {
+		s.mu.RLock()
+		if s.isAvailable {
+			snapshots = append(snapshots, serverSnapshot{s, s.priority, s.weight})
 		}
+		s.mu.RUnlock()
+	}
+	serverMu.RUnlock()
 
-		// 在相同优先级内，使用加权随机
-		wi := si.weight / totalWeight
-		wj := sj.weight / totalWeight
-
-		// 生成随机数进行加权比较
-		return rand.Float64() < wi/(wi+wj)
+	// 按优先级和加权随机排序
+	sort.Slice(snapshots, func(i, j int) bool {
+		if snapshots[i].priority != snapshots[j].priority {
+			return snapshots[i].priority > snapshots[j].priority
+		}
+		// 相同优先级内使用加权随机
+		return rand.Float64()*snapshots[i].weight > rand.Float64()*snapshots[j].weight
 	})
 
-	// 对结果进行分组，保证相同优先级的服务器在一起
-	var result []*DNSServer
-	if len(available) > 0 {
-		currentPriority := available[0].priority
-		var samePriorityServers []*DNSServer
-
-		for _, server := range available {
-			if server.priority != currentPriority {
-				// 对相同优先级的服务器进行加权随机排序
-				result = append(result, samePriorityServers...)
-				samePriorityServers = []*DNSServer{server}
-				currentPriority = server.priority
-			} else {
-				samePriorityServers = append(samePriorityServers, server)
-			}
-		}
-		// 添加最后一组
-		result = append(result, samePriorityServers...)
+	result := make([]*DNSServer, len(snapshots))
+	for i, snap := range snapshots {
+		result[i] = snap.server
 	}
-
 	return result
 }
 
 // 启动健康检查
 func startHealthCheck() {
-	ticker := time.NewTicker(healthCheckInterval)
+	healthCheckTicker = time.NewTicker(healthCheckInterval)
 	go func() {
 		// 启动时立即进行一次检查，使用 true 来忽略 nextCheck 时间
 		checkAllServers(true)
 
-		for range ticker.C {
+		for range healthCheckTicker.C {
 			// 定时检查时使用 false，遵守 nextCheck 时间限制
 			checkAllServers(false)
 		}
@@ -346,64 +317,34 @@ func logHealthCheckResults() {
 	serverMu.RLock()
 	defer serverMu.RUnlock()
 
-	var stats struct {
-		Available   int
-		Unavailable int
-		TotalWeight float64
-		Servers     []struct {
-			Addr    string
-			Status  string
-			Weight  float64
-			Latency float64
-		}
-	}
+	var available, unavailable int
+	var totalWeight float64
 
 	for _, server := range upstreamServers {
 		server.mu.RLock()
-		serverStat := struct {
-			Addr    string
-			Status  string
-			Weight  float64
-			Latency float64
-		}{
-			Addr:    server.addr,
-			Status:  map[bool]string{true: "可用", false: "不可用"}[server.isAvailable],
-			Weight:  server.weight,
-			Latency: server.avgLatency,
-		}
-
 		if server.isAvailable {
-			stats.Available++
-			stats.TotalWeight += server.weight
+			available++
+			totalWeight += server.weight
 		} else {
-			stats.Unavailable++
+			unavailable++
 		}
-		stats.Servers = append(stats.Servers, serverStat)
 		server.mu.RUnlock()
 	}
 
-	log.Debugf("健康检查结果：可用=%d 不可用=%d 总权重=%.2f\n详细信息：%+v",
-		stats.Available, stats.Unavailable, stats.TotalWeight, stats.Servers)
+	log.Debugf("健康检查结果：可用=%d 不可用=%d 总权重=%.2f", available, unavailable, totalWeight)
 }
 
-// 启动统计自动重置
 func startStatsReset() {
-	c := cron.New()
-
-	// 添加定时任务
-	_, err := c.AddFunc(statsResetCron, func() {
-		atomic.StoreInt64(&cacheHits, 0)
-		atomic.StoreInt64(&cacheMisses, 0)
-		statsResetTime = time.Now()
-		log.Infof("缓存统计已自动重置 - 时间: %s", statsResetTime.Format("2006-01-02 15:04:05"))
+	cronScheduler = cron.New()
+	_, err := cronScheduler.AddFunc(statsResetCron, func() {
+		now := resetStats()
+		log.Infof("缓存统计已自动重置 - 时间: %s", now.Format("2006-01-02 15:04:05"))
 	})
-
 	if err != nil {
 		log.Errorf("添加统计重置定时任务失败: %v", err)
 		return
 	}
-
-	c.Start()
+	cronScheduler.Start()
 }
 
 func handle(c *fiber.Ctx) error {
@@ -448,6 +389,9 @@ func handle(c *fiber.Ctx) error {
 			"error": "请求格式无效",
 		})
 	}
+
+	q := msg.Question[0]
+	log.Debugf("DNS查询 - 客户端: %s, 域名: %s, 类型: %s", getRealIP(c), q.Name, dnsTypeToString(q.Qtype))
 
 	msg.SetEdns0(4096, false)
 
@@ -610,19 +554,25 @@ func calculateCacheTTL(resp *dns.Msg) time.Duration {
 // 监控缓存大小
 func monitorCacheSize() {
 	ticker := time.NewTicker(1 * time.Minute)
-	for range ticker.C {
-		itemCount := dnsCache.ItemCount()
-		if itemCount > maxCacheItems {
-			// 如果超过最大条目数，清除一半的缓存
-			removeCount := itemCount - maxCacheItems
-			log.Warnf("缓存条目数量(%d)超过限制(%d)，准备清理%d个条目",
-				itemCount, maxCacheItems, removeCount)
-			pruneCache(removeCount)
-		}
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			itemCount := dnsCache.ItemCount()
+			if itemCount > maxCacheItems {
+				// 如果超过最大条目数，清除一半的缓存
+				removeCount := itemCount - maxCacheItems
+				log.Warnf("缓存条目数量(%d)超过限制(%d)，准备清理%d个条目",
+					itemCount, maxCacheItems, removeCount)
+				pruneCache(removeCount)
+			}
 
-		// 记录当前缓存状态
-		log.Infof("当前缓存状态 - 条目数: %d, 使用率: %.2f%%",
-			itemCount, float64(itemCount)/float64(maxCacheItems)*100)
+			// 记录当前缓存状态
+			log.Infof("当前缓存状态 - 条目数: %d, 使用率: %.2f%%",
+				itemCount, float64(itemCount)/float64(maxCacheItems)*100)
+		case <-monitorStopCh:
+			return
+		}
 	}
 }
 
@@ -745,7 +695,7 @@ func forwardToUpstreamDNS(msg *dns.Msg) (*dns.Msg, error) {
 	}
 
 	var lastError error
-	for i := 0; i < len(servers); i++ {
+	for range len(servers) {
 		response := <-responses
 		if response.err == nil && response.resp != nil {
 			log.Infof("DNS查询成功 - 服务器: %s, 域名: %s, 类型: %s, 延迟: %v",
@@ -805,10 +755,7 @@ func (s *DNSServer) query(msg *dns.Msg, ctx context.Context) (*dns.Msg, time.Dur
 				return resp, rtt, nil
 			}
 			lastErr = err
-			backoff := time.Duration(math.Pow(2, float64(retry))) * 50 * time.Millisecond
-			if backoff > time.Second {
-				backoff = time.Second
-			}
+			backoff := min(time.Duration(math.Pow(2, float64(retry)))*50*time.Millisecond, time.Second)
 			time.Sleep(backoff)
 		}
 	}
@@ -914,7 +861,7 @@ func handleStatus(c *fiber.Ctx) error {
 	if total > 0 {
 		status.Cache.HitRate = float64(hits) / float64(total) * 100
 	}
-	status.Cache.ResetTime = statsResetTime.Format("2006-01-02 15:04:05")
+	status.Cache.ResetTime = statsResetTime.Load().(time.Time).Format("2006-01-02 15:04:05")
 
 	return c.JSON(status)
 }
@@ -928,41 +875,38 @@ func handleManualCheck(c *fiber.Ctx) error {
 	})
 }
 
-// 添加重置统计的接口
+func resetStats() time.Time {
+	atomic.StoreInt64(&cacheHits, 0)
+	atomic.StoreInt64(&cacheMisses, 0)
+	now := time.Now()
+	statsResetTime.Store(now)
+	return now
+}
+
 func handleResetStats(c *fiber.Ctx) error {
 	action := c.Query("action", "all")
 
 	switch action {
 	case "reset":
-		// 重置统计数据
-		atomic.StoreInt64(&cacheHits, 0)
-		atomic.StoreInt64(&cacheMisses, 0)
-		statsResetTime = time.Now()
-
+		now := resetStats()
 		return c.JSON(fiber.Map{
 			"message": "统计已重置",
-			"time":    statsResetTime.Format("2006-01-02 15:04:05"),
+			"time":    now.Format("2006-01-02 15:04:05"),
 		})
 
 	case "clear":
-		// 清空缓存
 		dnsCache.Flush()
-
 		return c.JSON(fiber.Map{
 			"message": "缓存已清空",
 			"time":    time.Now().Format("2006-01-02 15:04:05"),
 		})
 
 	case "all":
-		// 同时执行重置统计和清空缓存
-		atomic.StoreInt64(&cacheHits, 0)
-		atomic.StoreInt64(&cacheMisses, 0)
-		statsResetTime = time.Now()
+		now := resetStats()
 		dnsCache.Flush()
-
 		return c.JSON(fiber.Map{
 			"message": "统计已重置且缓存已清空",
-			"time":    statsResetTime.Format("2006-01-02 15:04:05"),
+			"time":    now.Format("2006-01-02 15:04:05"),
 		})
 
 	default:
@@ -975,14 +919,7 @@ func handleResetStats(c *fiber.Ctx) error {
 
 func (s *DNSServer) calculateWeight(avgLatency float64) float64 {
 	weight := baseWeight / (avgLatency + 10)
-
-	// 添加权重范围限制
-	if weight < minWeight {
-		return minWeight
-	} else if weight > maxWeight {
-		return maxWeight
-	}
-	return weight
+	return max(minWeight, min(weight, maxWeight))
 }
 
 func handleVersion(c *fiber.Ctx) error {
@@ -1017,7 +954,7 @@ func handleCacheInfo(c *fiber.Ctx) error {
 	if total > 0 {
 		cacheInfo.Summary.HitRate = float64(cacheInfo.Summary.Hits) / float64(total) * 100
 	}
-	cacheInfo.Summary.LastResetTime = statsResetTime.Format("2006-01-02 15:04:05")
+	cacheInfo.Summary.LastResetTime = statsResetTime.Load().(time.Time).Format("2006-01-02 15:04:05")
 
 	// 如果请求详细信息，则填充缓存条目
 	// 预分配切片以提高性能
@@ -1064,7 +1001,7 @@ func handleCacheInfo(c *fiber.Ctx) error {
 				Type:      dnsTypeToString(uint16(qtype)),
 				TTL:       remainingTTL,
 				CacheTime: entry.CacheTime.Format("2006-01-02 15:04:05"),
-				ExpireAt:  time.Unix(0, item.Expiration).Format("2006-01-02 15:04:05"),
+				ExpireAt:  time.Unix(item.Expiration, 0).Format("2006-01-02 15:04:05"),
 				Size:      size,
 				Answers:   answers,
 			}
@@ -1127,10 +1064,7 @@ func main() {
 		},
 		Next: func(c *fiber.Ctx) bool {
 			ua := strings.ToLower(c.Get("User-Agent"))
-			if strings.Contains(ua, "kube-probe") || strings.Contains(ua, "uptime-kuma") {
-				return true
-			}
-			return false
+			return strings.Contains(ua, "kube-probe") || strings.Contains(ua, "uptime-kuma")
 		},
 	}))
 	app.Use(healthcheck.New(healthcheck.Config{
@@ -1177,6 +1111,19 @@ func main() {
 		<-quit
 		log.Info("正在关闭服务器...")
 
+		// 停止健康检查
+		if healthCheckTicker != nil {
+			healthCheckTicker.Stop()
+		}
+		// 停止 cron 任务
+		if cronScheduler != nil {
+			cronScheduler.Stop()
+		}
+		// 停止缓存监控
+		if monitorStopCh != nil {
+			close(monitorStopCh)
+		}
+
 		// 设置关闭超时
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -1191,6 +1138,10 @@ func main() {
 
 	// 启动统计自动重置
 	startStatsReset()
+
+	// 启动缓存监控
+	monitorStopCh = make(chan struct{})
+	go monitorCacheSize()
 
 	if err := app.Listen(":65001"); err != nil {
 		log.Error("服务器启动失败:", err)
