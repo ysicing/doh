@@ -20,12 +20,12 @@ import (
 
 	"github.com/ergoapi/util/environ"
 	"github.com/ergoapi/util/exnet"
-	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/log"
-	"github.com/gofiber/fiber/v2/middleware/healthcheck"
-	"github.com/gofiber/fiber/v2/middleware/logger"
-	"github.com/gofiber/fiber/v2/middleware/monitor"
-	"github.com/gofiber/fiber/v2/middleware/requestid"
+	"github.com/gofiber/contrib/v3/monitor"
+	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/log"
+	"github.com/gofiber/fiber/v3/middleware/healthcheck"
+	"github.com/gofiber/fiber/v3/middleware/logger"
+	"github.com/gofiber/fiber/v3/middleware/requestid"
 
 	"github.com/miekg/dns"
 	"github.com/patrickmn/go-cache"
@@ -69,7 +69,7 @@ var (
 	monitorStopCh     chan struct{}
 
 	// 版本信息变量,通过编译时注入
-	AppVersion = "1.1.9"
+	AppVersion = "1.1.10"
 	BuildTime  = "unknown"
 	GitCommit  = ""
 	GoVersion  = runtime.Version()
@@ -89,8 +89,7 @@ const (
 	maxCheckDelay       = 30 * time.Minute
 
 	// 缓存相关
-	defaultCacheTTL = 5 * time.Minute
-	maxCacheTTL     = 300 * time.Second
+	maxCacheTTL     = 5 * time.Minute
 	cleanupInterval = 30 * time.Second
 	maxCacheItems   = 10000
 	maxItemSize     = 4096
@@ -141,22 +140,93 @@ type CacheInfo struct {
 	Items []CacheEntry `json:"items"`
 }
 
+type cachedResponse struct {
+	Response  *dns.Msg
+	CacheTime time.Time
+}
+
+var defaultUpstreamAddrs = []string{
+	"8.8.8.8:53|99",
+	"8.8.4.4:53|99",
+	"[2001:4860:4860::8888]:53|99",
+	"[2001:4860:4860::8844]:53|99",
+	"1.1.1.1:53|98",
+	"1.0.0.1:53|98",
+	"[2606:4700:4700::1111]:53|98",
+	"[2606:4700:4700::1001]:53|98",
+}
+
 func init() {
-	upstreamServers = []*DNSServer{
-		newDNSServer("8.8.8.8:53", 99, false),
-		newDNSServer("8.8.4.4:53", 99, false),
-		newDNSServer("[2001:4860:4860::8888]:53", 99, true),
-		newDNSServer("[2001:4860:4860::8844]:53", 99, true),
-		newDNSServer("1.1.1.1:53", 98, false),
-		newDNSServer("1.0.0.1:53", 98, false),
-		newDNSServer("[2606:4700:4700::1111]:53", 98, true),
-		newDNSServer("[2606:4700:4700::1001]:53", 98, true),
-	}
-	dnsCache = cache.New(defaultCacheTTL, cleanupInterval)
+	upstreamServers = loadUpstreamServers()
+	dnsCache = cache.New(maxCacheTTL, cleanupInterval)
 	dnsCache.OnEvicted(func(key string, value any) {
 		log.Debugf("缓存条目已过期或被驱逐 - Key: %s", key)
 	})
 	statsResetTime.Store(time.Now())
+}
+
+func loadUpstreamServers() []*DNSServer {
+	raw := strings.TrimSpace(environ.GetEnv("DOH_UPSTREAMS", ""))
+	if raw == "" {
+		raw = strings.Join(defaultUpstreamAddrs, ",")
+	}
+
+	parts := strings.Split(raw, ",")
+	servers := make([]*DNSServer, 0, len(parts))
+	for idx, part := range parts {
+		server, err := parseUpstreamServer(strings.TrimSpace(part), idx)
+		if err != nil {
+			log.Warnf("跳过无效上游配置 %q: %v", part, err)
+			continue
+		}
+		servers = append(servers, server)
+	}
+
+	if len(servers) == 0 {
+		log.Warn("未加载到有效上游，回退到默认配置")
+		for idx, entry := range defaultUpstreamAddrs {
+			server, err := parseUpstreamServer(entry, idx)
+			if err == nil {
+				servers = append(servers, server)
+			}
+		}
+	}
+
+	return servers
+}
+
+func parseUpstreamServer(entry string, idx int) (*DNSServer, error) {
+	if entry == "" {
+		return nil, fmt.Errorf("empty upstream entry")
+	}
+
+	priority := 100 - idx
+	addr := entry
+	if strings.Contains(entry, "|") {
+		parts := strings.SplitN(entry, "|", 2)
+		addr = strings.TrimSpace(parts[0])
+		if addr == "" {
+			return nil, fmt.Errorf("empty address")
+		}
+		if strings.TrimSpace(parts[1]) != "" {
+			parsedPriority, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+			if err != nil {
+				return nil, fmt.Errorf("invalid priority: %w", err)
+			}
+			priority = parsedPriority
+		}
+	}
+
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid host:port: %w", err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return nil, fmt.Errorf("host is not an IP address")
+	}
+
+	return newDNSServer(addr, priority, ip.To4() == nil), nil
 }
 
 func newDNSServer(addr string, priority int, isIPv6 bool) *DNSServer {
@@ -235,18 +305,33 @@ func getAvailableServers() []*DNSServer {
 	}
 	serverMu.RUnlock()
 
-	// 按优先级和加权随机排序
-	sort.Slice(snapshots, func(i, j int) bool {
-		if snapshots[i].priority != snapshots[j].priority {
-			return snapshots[i].priority > snapshots[j].priority
+	grouped := make(map[int][]serverSnapshot)
+	priorities := make([]int, 0, len(snapshots))
+	for _, snap := range snapshots {
+		if _, ok := grouped[snap.priority]; !ok {
+			priorities = append(priorities, snap.priority)
 		}
-		// 相同优先级内使用加权随机
-		return rand.Float64()*snapshots[i].weight > rand.Float64()*snapshots[j].weight
+		grouped[snap.priority] = append(grouped[snap.priority], snap)
+	}
+
+	sort.Slice(priorities, func(i, j int) bool {
+		return priorities[i] > priorities[j]
 	})
 
 	result := make([]*DNSServer, len(snapshots))
-	for i, snap := range snapshots {
-		result[i] = snap.server
+	idx := 0
+	for _, priority := range priorities {
+		group := grouped[priority]
+		rand.Shuffle(len(group), func(i, j int) {
+			group[i], group[j] = group[j], group[i]
+		})
+		sort.SliceStable(group, func(i, j int) bool {
+			return group[i].weight > group[j].weight
+		})
+		for _, snap := range group {
+			result[idx] = snap.server
+			idx++
+		}
 	}
 	return result
 }
@@ -309,7 +394,7 @@ func checkServer(ctx context.Context, server *DNSServer, msg *dns.Msg, ignoreNex
 	}
 	server.mu.Unlock()
 
-	_, rtt, err := server.query(msg.Copy(), ctx) // 使用消息的副本
+	_, rtt, err := server.query(ctx, msg.Copy()) // 使用消息的副本
 	server.updateStatus(rtt, err)
 }
 
@@ -347,14 +432,20 @@ func startStatsReset() {
 	cronScheduler.Start()
 }
 
-func handle(c *fiber.Ctx) error {
+func handle(c fiber.Ctx) error {
 	var dnsMsg []byte
 	var err error
 
 	if c.Method() == "GET" {
+		if !acceptsDNSMessage(c) {
+			return c.Status(fiber.StatusNotAcceptable).JSON(fiber.Map{
+				"error": "客户端不接受DNS消息响应",
+			})
+		}
+
 		dnsParam := c.Query("dns")
 		if dnsParam == "" {
-			return c.Redirect("/deepseek", 302)
+			return c.Redirect().Status(fiber.StatusFound).To("/deepseek")
 		}
 		dnsMsg, err = base64.RawURLEncoding.DecodeString(dnsParam)
 		if err != nil {
@@ -364,6 +455,16 @@ func handle(c *fiber.Ctx) error {
 			})
 		}
 	} else {
+		if !isDNSMessageContentType(c.Get("Content-Type")) {
+			return c.Status(fiber.StatusUnsupportedMediaType).JSON(fiber.Map{
+				"error": "请求 Content-Type 必须为 application/dns-message",
+			})
+		}
+		if !acceptsDNSMessage(c) {
+			return c.Status(fiber.StatusNotAcceptable).JSON(fiber.Map{
+				"error": "客户端不接受DNS消息响应",
+			})
+		}
 		dnsMsg = c.Body()
 	}
 
@@ -392,8 +493,6 @@ func handle(c *fiber.Ctx) error {
 
 	q := msg.Question[0]
 	log.Debugf("DNS查询 - 客户端: %s, 域名: %s, 类型: %s", getRealIP(c), q.Name, dnsTypeToString(q.Qtype))
-
-	msg.SetEdns0(4096, false)
 
 	resp, err := forwardToUpstreamDNS(msg)
 	if err != nil {
@@ -435,13 +534,37 @@ func handle(c *fiber.Ctx) error {
 	return c.Send(packed)
 }
 
+func isDNSMessageContentType(contentType string) bool {
+	mediaType := strings.TrimSpace(strings.ToLower(strings.SplitN(contentType, ";", 2)[0]))
+	return mediaType == "application/dns-message"
+}
+
+func acceptsDNSMessage(c fiber.Ctx) bool {
+	accept := strings.TrimSpace(strings.ToLower(c.Get("Accept")))
+	if accept == "" || accept == "*/*" {
+		return true
+	}
+
+	for _, part := range strings.Split(accept, ",") {
+		mediaType := strings.TrimSpace(strings.ToLower(strings.SplitN(part, ";", 2)[0]))
+		if mediaType == "*/*" || mediaType == "application/*" || mediaType == "application/dns-message" {
+			return true
+		}
+	}
+	return false
+}
+
 // 获取缓存key
 func getCacheKey(msg *dns.Msg) string {
 	if len(msg.Question) == 0 {
 		return ""
 	}
 	q := msg.Question[0]
-	return fmt.Sprintf("%d@%s", q.Qtype, q.Name)
+	do := false
+	if opt := msg.IsEdns0(); opt != nil {
+		do = opt.Do()
+	}
+	return fmt.Sprintf("%d@%d@%t@%s", q.Qclass, q.Qtype, do, q.Name)
 }
 
 // 从缓存获取响应
@@ -452,20 +575,23 @@ func getFromCache(msg *dns.Msg) *dns.Msg {
 		return nil
 	}
 
-	if cached, found := dnsCache.Get(key); found {
-		if entry, ok := cached.(*struct {
-			Response  *dns.Msg
-			CacheTime time.Time
-		}); ok {
+	if cached, expiresAt, found := dnsCache.GetWithExpiration(key); found {
+		if entry, ok := cached.(*cachedResponse); ok {
 			// 调整TTL值
 			elapsed := time.Since(entry.CacheTime)
 			resp := entry.Response.Copy()
-
-			// 更新所有记录的TTL，使用实际剩余的缓存时间
-			for _, rr := range resp.Answer {
-				newTTL := uint32(math.Max(0, float64(maxCacheTTL.Seconds())-elapsed.Seconds()))
-				rr.Header().Ttl = newTTL
+			remainingTTL := uint32(0)
+			if !expiresAt.IsZero() {
+				remaining := time.Until(expiresAt)
+				if remaining > 0 {
+					remainingTTL = uint32(remaining / time.Second)
+				}
 			}
+
+			// 使用缓存真实剩余时间回写 TTL，且不超过原始 TTL。
+			adjustTTL(resp.Answer, remainingTTL)
+			adjustTTL(resp.Ns, remainingTTL)
+			adjustTTL(resp.Extra, remainingTTL)
 
 			// 更新响应的ID以匹配请求
 			resp.Id = msg.Id
@@ -511,44 +637,91 @@ func addToCache(msg *dns.Msg, resp *dns.Msg) {
 	// 记录缓存时间
 	cacheTime := time.Now()
 
-	cacheEntry := &struct {
-		Response  *dns.Msg
-		CacheTime time.Time
-	}{
+	cacheEntry := &cachedResponse{
 		Response:  cachedResp,
 		CacheTime: cacheTime,
 	}
 
 	ttl := calculateCacheTTL(resp)
+	if ttl <= 0 {
+		return
+	}
 	dnsCache.Set(key, cacheEntry, ttl)
 }
 
 func calculateCacheTTL(resp *dns.Msg) time.Duration {
-	if len(resp.Answer) == 0 {
-		return defaultCacheTTL
+	if resp == nil || resp.Truncated {
+		return 0
 	}
 
-	// 获取响应中最小的TTL
-	minTTL := uint32(maxCacheTTL.Seconds())
-	for _, rr := range resp.Answer {
-		if rr.Header().Ttl < minTTL {
-			minTTL = rr.Header().Ttl
+	if len(resp.Answer) > 0 {
+		// 获取响应中最小的TTL
+		minTTL := ^uint32(0)
+		for _, rr := range resp.Answer {
+			if rr.Header().Ttl < minTTL {
+				minTTL = rr.Header().Ttl
+			}
+		}
+
+		if minTTL == 0 {
+			return 0
+		}
+
+		ttl := time.Duration(minTTL) * time.Second
+		if ttl > maxCacheTTL {
+			return maxCacheTTL
+		}
+		return ttl
+	}
+
+	if resp.Rcode == dns.RcodeNameError || resp.Rcode == dns.RcodeSuccess {
+		if ttl := negativeCacheTTL(resp); ttl > 0 {
+			return ttl
+		}
+	}
+
+	return 0
+}
+
+func negativeCacheTTL(resp *dns.Msg) time.Duration {
+	var minTTL uint32
+	for _, rr := range resp.Ns {
+		soa, ok := rr.(*dns.SOA)
+		if !ok {
+			continue
+		}
+
+		candidate := soa.Hdr.Ttl
+		if soa.Minttl > 0 && soa.Minttl < candidate {
+			candidate = soa.Minttl
+		}
+		if candidate == 0 {
+			continue
+		}
+		if minTTL == 0 || candidate < minTTL {
+			minTTL = candidate
 		}
 	}
 
 	ttl := time.Duration(minTTL) * time.Second
-
-	// 如果上游返回的TTL小于maxCacheTTL，则使用maxCacheTTL
-	if ttl < maxCacheTTL {
-		// 修改响应中的TTL值为maxCacheTTL
-		for _, rr := range resp.Answer {
-			rr.Header().Ttl = uint32(maxCacheTTL.Seconds())
-		}
+	if ttl <= 0 {
+		return 0
+	}
+	if ttl > maxCacheTTL {
 		return maxCacheTTL
 	}
-
-	// 使用上游返回的TTL
 	return ttl
+}
+
+func adjustTTL(records []dns.RR, remainingTTL uint32) {
+	for _, rr := range records {
+		if rr.Header().Rrtype == dns.TypeOPT {
+			continue
+		}
+		if remainingTTL == 0 || rr.Header().Ttl > remainingTTL {
+			rr.Header().Ttl = remainingTTL
+		}
+	}
 }
 
 // 监控缓存大小
@@ -559,9 +732,9 @@ func monitorCacheSize() {
 		select {
 		case <-ticker.C:
 			itemCount := dnsCache.ItemCount()
-			if itemCount > maxCacheItems {
-				// 如果超过最大条目数，清除一半的缓存
-				removeCount := itemCount - maxCacheItems
+			if itemCount >= maxCacheItems {
+				// 并发写入可能短暂超过阈值，定期修剪回上限以内。
+				removeCount := max(1, itemCount-maxCacheItems+1)
 				log.Warnf("缓存条目数量(%d)超过限制(%d)，准备清理%d个条目",
 					itemCount, maxCacheItems, removeCount)
 				pruneCache(removeCount)
@@ -643,9 +816,6 @@ func forwardToUpstreamDNS(msg *dns.Msg) (*dns.Msg, error) {
 		return nil, fmt.Errorf("无效的DNS查询：空的Question段")
 	}
 
-	// 添加大小限制
-	msg.SetEdns0(4096, false)
-
 	// 首先尝试从缓存获取
 	if cachedResp := getFromCache(msg); cachedResp != nil {
 		return cachedResp, nil
@@ -662,41 +832,66 @@ func forwardToUpstreamDNS(msg *dns.Msg) (*dns.Msg, error) {
 		server  string
 		latency time.Duration
 	}
-	responses := make(chan dnsResponse, len(servers))
+	workerCount := len(servers)
+	responses := make(chan dnsResponse, workerCount)
 	ctx, cancel := context.WithTimeout(context.Background(), totalTimeout)
 	defer cancel()
+	jobs := make(chan *DNSServer)
+	var wg sync.WaitGroup
 
-	for _, server := range servers {
-		go func(server *DNSServer) {
-			start := time.Now()
-			resp, rtt, err := server.query(msg, ctx)
+	for range workerCount {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for server := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
 
-			// 验证响应
-			if err == nil && resp != nil {
-				// 检查响应大小
-				if packed, err := resp.Pack(); err == nil && len(packed) > 4096 {
-					resp.Truncate(4096)
+				start := time.Now()
+				resp, rtt, err := server.query(ctx, msg)
+
+				// 验证响应
+				if err == nil && resp != nil {
+					if packed, packErr := resp.Pack(); packErr == nil && len(packed) > 4096 {
+						resp.Truncate(4096)
+					}
+				}
+
+				server.updateStatus(rtt, err)
+
+				select {
+				case <-ctx.Done():
+					return
+				case responses <- dnsResponse{
+					resp:    resp,
+					err:     err,
+					server:  server.addr,
+					latency: time.Since(start),
+				}:
 				}
 			}
+		}()
+	}
 
-			server.updateStatus(rtt, err)
-
+	go func() {
+		defer close(jobs)
+		for _, server := range servers {
 			select {
 			case <-ctx.Done():
 				return
-			case responses <- dnsResponse{
-				resp:    resp,
-				err:     err,
-				server:  server.addr,
-				latency: time.Since(start),
-			}:
+			case jobs <- server:
 			}
-		}(server)
-	}
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(responses)
+	}()
 
 	var lastError error
-	for range len(servers) {
-		response := <-responses
+	for response := range responses {
 		if response.err == nil && response.resp != nil {
 			log.Infof("DNS查询成功 - 服务器: %s, 域名: %s, 类型: %s, 延迟: %v",
 				response.server,
@@ -705,6 +900,7 @@ func forwardToUpstreamDNS(msg *dns.Msg) (*dns.Msg, error) {
 				response.latency)
 
 			addToCache(msg, response.resp)
+			cancel()
 			return response.resp, nil
 		}
 		lastError = response.err
@@ -713,7 +909,7 @@ func forwardToUpstreamDNS(msg *dns.Msg) (*dns.Msg, error) {
 	return nil, fmt.Errorf("所有DNS服务器查询失败，最后错误: %v", lastError)
 }
 
-func (s *DNSServer) query(msg *dns.Msg, ctx context.Context) (*dns.Msg, time.Duration, error) {
+func (s *DNSServer) query(ctx context.Context, msg *dns.Msg) (*dns.Msg, time.Duration, error) {
 	// 添加消息有效性检查
 	if msg == nil {
 		return nil, 0, fmt.Errorf("无效的DNS查询消息")
@@ -741,7 +937,7 @@ func (s *DNSServer) query(msg *dns.Msg, ctx context.Context) (*dns.Msg, time.Dur
 		case <-ctx.Done():
 			return nil, 0, ctx.Err()
 		default:
-			resp, rtt, err := dnsClient.Exchange(queryMsg, s.addr)
+			resp, rtt, err := dnsClient.ExchangeContext(ctx, queryMsg, s.addr)
 			if err == nil && resp != nil {
 				// 验证响应
 				if resp.IsEdns0() == nil {
@@ -756,7 +952,15 @@ func (s *DNSServer) query(msg *dns.Msg, ctx context.Context) (*dns.Msg, time.Dur
 			}
 			lastErr = err
 			backoff := min(time.Duration(math.Pow(2, float64(retry)))*50*time.Millisecond, time.Second)
-			time.Sleep(backoff)
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return nil, 0, ctx.Err()
+			case <-timer.C:
+			}
 		}
 	}
 	return nil, 0, lastErr
@@ -817,7 +1021,7 @@ type SystemStatus struct {
 	} `json:"cache"`
 }
 
-func handleStatus(c *fiber.Ctx) error {
+func handleStatus(c fiber.Ctx) error {
 	serverMu.RLock()
 	defer serverMu.RUnlock()
 
@@ -867,7 +1071,7 @@ func handleStatus(c *fiber.Ctx) error {
 }
 
 // 修改手动触发健康检查的处理函数
-func handleManualCheck(c *fiber.Ctx) error {
+func handleManualCheck(c fiber.Ctx) error {
 	// 手动触发时也使用 true，确保检查所有服务器
 	go checkAllServers(true)
 	return c.JSON(fiber.Map{
@@ -883,7 +1087,7 @@ func resetStats() time.Time {
 	return now
 }
 
-func handleResetStats(c *fiber.Ctx) error {
+func handleResetStats(c fiber.Ctx) error {
 	action := c.Query("action", "all")
 
 	switch action {
@@ -922,7 +1126,7 @@ func (s *DNSServer) calculateWeight(avgLatency float64) float64 {
 	return max(minWeight, min(weight, maxWeight))
 }
 
-func handleVersion(c *fiber.Ctx) error {
+func handleVersion(c fiber.Ctx) error {
 	return c.JSON(VersionInfo{
 		Version:   AppVersion,
 		BuildTime: BuildTime,
@@ -933,7 +1137,7 @@ func handleVersion(c *fiber.Ctx) error {
 	})
 }
 
-func handleCacheInfo(c *fiber.Ctx) error {
+func handleCacheInfo(c fiber.Ctx) error {
 	cacheInfo := CacheInfo{}
 	items := dnsCache.Items()
 
@@ -966,18 +1170,15 @@ func handleCacheInfo(c *fiber.Ctx) error {
 			continue
 		}
 
-		if entry, ok := item.Object.(*struct {
-			Response  *dns.Msg
-			CacheTime time.Time
-		}); ok {
-			// 解析缓存键：格式为 "{Qtype}@{Name}"
-			parts := strings.SplitN(k, "@", 2)
-			if len(parts) != 2 {
+		if entry, ok := item.Object.(*cachedResponse); ok {
+			// 解析缓存键：格式为 "{Qclass}@{Qtype}@{DO}@{Name}"
+			parts := strings.SplitN(k, "@", 4)
+			if len(parts) != 4 {
 				continue
 			}
 
-			qtype, _ := strconv.Atoi(parts[0])
-			domain := parts[1]
+			qtype, _ := strconv.Atoi(parts[1])
+			domain := parts[3]
 
 			// 计算剩余TTL
 			remainingTTL := int64(item.Expiration - time.Now().Unix())
@@ -1023,33 +1224,71 @@ func handleCacheInfo(c *fiber.Ctx) error {
 	return c.JSON(cacheInfo)
 }
 
-func getRealIP(c *fiber.Ctx) string {
-	if ip := c.Get("CF-Connecting-IP"); ip != "" {
+func getRealIP(c fiber.Ctx) string {
+	if ip := parseHeaderIP(c.Get("CF-Connecting-IP")); ip != "" {
 		return ip
 	}
-	if ip := c.Get("True-Client-IP"); ip != "" {
+	if ip := parseHeaderIP(c.Get("True-Client-IP")); ip != "" {
 		return ip
 	}
-	if ip := c.Get("X-Real-IP"); ip != "" {
+	if ip := parseHeaderIP(c.Get("X-Real-IP")); ip != "" {
 		return ip
 	}
 	if forwarded := c.Get("X-Forwarded-For"); forwarded != "" {
 		ips := strings.Split(forwarded, ",")
 		for _, ip := range ips {
-			ip = strings.TrimSpace(ip)
-			if ip != "" && !exnet.IsPrivateNetIP(net.ParseIP(ip)) {
-				return ip
+			if parsed := parseHeaderIP(ip); parsed != "" && !exnet.IsPrivateNetIP(net.ParseIP(parsed)) {
+				return parsed
 			}
 		}
+	}
+	if ip := parseHeaderIP(c.IP()); ip != "" {
+		return ip
 	}
 	return c.IP()
 }
 
+func parseHeaderIP(raw string) string {
+	ip := net.ParseIP(strings.TrimSpace(raw))
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
+}
+
+func allowDebug(c fiber.Ctx) bool {
+	if environ.GetEnv("DOH_DEBUG_ENABLED", "") != "1" {
+		return false
+	}
+
+	expectedToken := strings.TrimSpace(environ.GetEnv("DOH_DEBUG_TOKEN", ""))
+	if expectedToken != "" {
+		authHeader := strings.TrimSpace(c.Get("Authorization"))
+		if strings.HasPrefix(authHeader, "Bearer ") && strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer ")) == expectedToken {
+			return true
+		}
+		if strings.TrimSpace(c.Get("X-Debug-Token")) == expectedToken {
+			return true
+		}
+		return false
+	}
+
+	ip := net.ParseIP(getRealIP(c))
+	return ip != nil && (ip.IsLoopback() || exnet.IsPrivateNetIP(ip))
+}
+
+func debugMiddleware(c fiber.Ctx) error {
+	if !allowDebug(c) {
+		return c.SendStatus(fiber.StatusNotFound)
+	}
+	return c.Next()
+}
+
 func main() {
 	app := fiber.New(fiber.Config{
-		ServerHeader: "Caddy",
-		ErrorHandler: func(c *fiber.Ctx, err error) error {
-			return c.Redirect("/deepseek", 302)
+		ServerHeader: "Caddy2",
+		ErrorHandler: func(c fiber.Ctx, err error) error {
+			return c.Redirect().Status(fiber.StatusFound).To("/deepseek")
 		},
 	})
 	app.Use(requestid.New())
@@ -1058,24 +1297,24 @@ func main() {
 		TimeFormat: "2006-01-02 15:04:05",
 		TimeZone:   "Asia/Shanghai",
 		CustomTags: map[string]logger.LogFunc{
-			"clientip": func(output logger.Buffer, c *fiber.Ctx, data *logger.Data, extraParam string) (int, error) {
+			"clientip": func(output logger.Buffer, c fiber.Ctx, data *logger.Data, extraParam string) (int, error) {
 				return output.WriteString(getRealIP(c))
 			},
 		},
-		Next: func(c *fiber.Ctx) bool {
+		Next: func(c fiber.Ctx) bool {
 			ua := strings.ToLower(c.Get("User-Agent"))
 			return strings.Contains(ua, "kube-probe") || strings.Contains(ua, "uptime-kuma")
 		},
 	}))
-	app.Use(healthcheck.New(healthcheck.Config{
-		LivenessProbe: func(c *fiber.Ctx) bool {
+	app.Get("/live", healthcheck.New(healthcheck.Config{
+		Probe: func(c fiber.Ctx) bool {
 			return true
 		},
-		LivenessEndpoint: "/live",
-		ReadinessProbe: func(c *fiber.Ctx) bool {
+	}))
+	app.Get("/ready", healthcheck.New(healthcheck.Config{
+		Probe: func(c fiber.Ctx) bool {
 			return true
 		},
-		ReadinessEndpoint: "/ready",
 	}))
 	app.Get("/metrics", monitor.New(monitor.Config{Title: "Caddy Metrics"}))
 
@@ -1090,6 +1329,7 @@ func main() {
 	app.Get("/version", handleVersion)
 
 	app.Route("/debug", func(router fiber.Router) {
+		router.Use(debugMiddleware)
 		// 添加缓存信息接口
 		router.Get("/cache", handleCacheInfo)
 		// 添加重置统计的接口
@@ -1100,7 +1340,7 @@ func main() {
 		router.Get("/status", handleStatus)
 	})
 
-	app.All("/deepseek", func(c *fiber.Ctx) error {
+	app.All("/deepseek", func(c fiber.Ctx) error {
 		return c.SendString("ip: " + getRealIP(c))
 	})
 
