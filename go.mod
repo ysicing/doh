@@ -1,9 +1,9 @@
 module github.com/ysicing/doh
 
-go 1.25.5
+go 1.26.1
 
 require (
-	github.com/ergoapi/util v1.3.0
+	github.com/ergoapi/util v1.4.0
 	github.com/gofiber/contrib/v3/monitor v1.0.1
 	github.com/gofiber/fiber/v3 v3.1.0
 	github.com/miekg/dns v1.1.72
