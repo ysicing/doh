@@ -2,7 +2,7 @@ name: build
 
 env:
   # Common versions
-  GO_VERSION: "1.25"
+  GO_VERSION: "1.27"
   TZ: Asia/Shanghai
 
 on:
@@ -21,26 +21,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: ${{ env.GO_VERSION }}
           check-latest: true
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: install task
-        run: |
-          echo "install task"
-          go install github.com/go-task/task/v3/cmd/task@latest
+        uses: go-task/setup-task@v2
       - name: Build
         run: |
           task ghcr
