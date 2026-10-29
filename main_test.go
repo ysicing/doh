@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/base64"
 	"net/http/httptest"
-	"os"
 	"testing"
 	"time"
 
@@ -73,7 +72,7 @@ func TestAdjustTTLSkipsOPTRecord(t *testing.T) {
 		Hdr: dns.RR_Header{Name: "example.org.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
 	}
 
-	adjustTTL([]dns.RR{opt, a}, 60)
+	adjustTTL([]dns.RR{opt, a}, 60, 60)
 
 	if opt.Hdr.Ttl != 0x8000 {
 		t.Fatalf("OPT TTL/flags = %d, want %d", opt.Hdr.Ttl, 0x8000)
@@ -141,18 +140,15 @@ func TestAllowDebugUsesRealClientIPWithoutToken(t *testing.T) {
 }
 
 func TestParseUpstreamServer(t *testing.T) {
-	server, err := parseUpstreamServer("8.8.8.8:53|77", 0)
+	server, err := parseUpstreamServer("8.8.8.8:53")
 	if err != nil {
 		t.Fatalf("parseUpstreamServer() error = %v", err)
 	}
 	if server.addr != "8.8.8.8:53" {
 		t.Fatalf("addr = %q, want %q", server.addr, "8.8.8.8:53")
 	}
-	if server.priority != 77 {
-		t.Fatalf("priority = %d, want %d", server.priority, 77)
-	}
-	if server.isIPv6 {
-		t.Fatal("expected IPv4 upstream")
+	if !server.isAvailable {
+		t.Fatal("new upstream should be eligible for its first query")
 	}
 }
 
@@ -194,8 +190,4 @@ func TestHandleGETRejectsUnsupportedAccept(t *testing.T) {
 	if resp.StatusCode != fiber.StatusNotAcceptable {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, fiber.StatusNotAcceptable)
 	}
-}
-
-func TestMain(m *testing.M) {
-	os.Exit(m.Run())
 }
